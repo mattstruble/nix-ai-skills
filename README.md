@@ -1,77 +1,120 @@
-# nix-ai-skills
+# nix-ai-agents
 
-A Nix flake that aggregates AI agent skills from multiple repositories into a
-single merged directory, deployed via Home Manager to the correct config path
-for each agent.
+A Nix flake that manages AI coding agent configuration via Home Manager:
+skills aggregation, config file generation, and shared MCP server definitions.
 
-## How It Works
+## Features
 
-1. **Discovery** -- Each skills source is scanned recursively for `SKILL.md`
-   files at any depth. The parent directory of each `SKILL.md` becomes the
-   skill name.
-2. **Merge** -- Skills from all sources are merged into a single flat
-   directory. Sources are processed in order; later entries override earlier
-   ones on name collision (last wins).
-3. **Deploy** -- The merged skills directory is symlinked into each enabled
-   agent's config path via Home Manager.
+- **Skills aggregation** -- Merge skills from multiple repositories into a
+  single directory, deployed to each enabled agent's config path.
+- **Config generation** -- Generate agent config files (e.g., `opencode.json`)
+  from Nix with per-host overrides through the module system.
+- **Shared MCP servers** -- Define MCP servers once, automatically inject into
+  all enabled agents. Per-agent overrides on name collision.
+- **AGENTS.md management** -- Deploy agent instruction files from a source
+  path or inline text.
 
-This means a skill at `repo/.cursor/skills/foo/bar/SKILL.md` is surfaced
-as `bar/` in the final output, alongside skills from other repos.
+## Agent Support
 
-## Agent Paths
-
-| Agent | Skills Path |
-|---|---|
-| `opencode` | `~/.config/opencode/skills/` |
-| `claude` | `~/.claude/skills/` |
-| `cursor` | `~/.cursor/skills/` |
+| Agent | Skills Path | Config File | Status |
+|---|---|---|---|
+| `opencode` | `~/.config/opencode/skills/` | `opencode.json` | Implemented |
+| `claude` | `~/.claude/skills/` | -- | Skills only |
+| `cursor` | `~/.cursor/skills/` | -- | Skills only |
 
 ## Installation
 
-Add `nix-ai-skills` to your flake inputs:
+Add `nix-ai-agents` to your flake inputs:
 
 ```nix
 # flake.nix
 {
   inputs = {
-    # ... existing inputs ...
-
-    ai-skills.url = "github:mattstruble/nix-ai-skills";
+    ai-agents.url = "github:mattstruble/nix-ai-agents";
 
     # Skills repositories as flake inputs (pinned via flake.lock)
     skills-core = {
-      url = "github:<repo-1>/skills";
+      url = "github:<repo>/skills";
       flake = false;
     };
   };
 }
 ```
 
-Then import the Home Manager module and configure it. Since `inputs` is
-typically passed via `extraSpecialArgs`, your Home Manager modules can
-reference the skills inputs directly:
+Then import the Home Manager module and configure it:
 
 ```nix
-# home.nix (or wherever your Home Manager config lives)
-{ inputs, ... }:
+# home.nix
+{ inputs, config, ... }:
 
+let
+  mkLink = config.lib.file.mkOutOfStoreSymlink;
+in
 {
-  imports = [ inputs.ai-skills.homeManagerModules.default ];
+  imports = [ inputs.ai-agents.homeManagerModules.default ];
 
-  programs.ai-skills = {
+  programs.ai-agents = {
     enable = true;
-    agents = [ "opencode" "claude" ];
+    agents = [ "opencode" ];
+
     skills = [
       inputs.skills-core
     ];
+
+    # Shared MCP servers -- injected into all enabled agents
+    mcpServers = {
+      context7 = {
+        type = "remote";
+        url = "https://mcp.context7.mcp";
+      };
+      filesystem = {
+        command = "npx";
+        args = [ "@modelcontextprotocol/server-filesystem" "/home" ];
+      };
+    };
+
+    # OpenCode-specific configuration
+    opencode = {
+      agentsFile = mkLink "/path/to/AGENTS.md";
+      config = {
+        "$schema" = "https://opencode.ai/config.json";
+        permission = {
+          bash."*" = "ask";
+          edit = "allow";
+          read = "allow";
+        };
+        # Agent-specific MCPs (merged with shared, wins on name collision)
+        # mcp.opencode-only-tool = { type = "stdio"; command = "..."; };
+      };
+    };
   };
 }
 ```
 
+### Per-Host Overrides
+
+The `opencode.config` option uses `pkgs.formats.json` which deep-merges
+through the Nix module system. Define shared config in your base `home.nix`
+and add host-specific overrides in per-host configs:
+
+```nix
+# hosts/work-machine/home.nix
+{
+  programs.ai-agents.opencode.config = {
+    provider.default = "bedrock";
+    mcp.internal-tool = {
+      command = "internal-mcp";
+      args = [ "--endpoint" "https://internal.corp" ];
+    };
+  };
+}
+```
+
+The module system merges this with the shared config automatically.
+
 ## Skills Sources
 
-Skills can be provided as either **flake inputs** or **git URLs**. You can
-mix both in the same list.
+Skills can be provided as either **flake inputs** or **git URLs**.
 
 ### Flake Inputs
 
@@ -86,32 +129,25 @@ inputs.skills-core = {
 };
 
 # home.nix
-programs.ai-skills.skills = [ inputs.skills-core ];
+programs.ai-agents.skills = [ inputs.skills-core ];
 ```
 
 ### Git URLs
 
-Specify a git URL directly in the module config. Useful for private repos
-that only some machines have access to, since each machine only fetches the
-URLs in its own config.
+Specify a git URL directly in the module config:
 
 ```nix
-programs.ai-skills.skills = [
-  inputs.skills-core                # flake input (public, pinned by flake.lock)
+programs.ai-agents.skills = [
+  inputs.skills-core
 
   {
     url = "https://github.com/me/my-skills";
-    ref = "v1.0.0";                 # pin to a tag
+    ref = "v1.0.0";
   }
 
   {
-    url = "git@github.com:corp/internal-skills.git";   # SSH, private
-    rev = "abc123def456789...";     # pin to exact commit
-  }
-
-  {
-    url = "https://github.com/me/dev-skills";
-    ref = "main";                   # track a branch (requires --impure)
+    url = "git@github.com:corp/internal-skills.git";
+    rev = "abc123def456789...";
   }
 ];
 ```
@@ -126,65 +162,92 @@ programs.ai-skills.skills = [
 
 ### Pure Eval and Pinning
 
-Nix flakes evaluate in pure mode by default. This affects git URL entries:
-
 - **With `rev`** -- Works in pure eval. Fully reproducible.
-- **With only `ref` (no `rev`)** -- Requires `--impure` flag. Nix resolves
-  the ref to a commit at evaluation time.
-- **Neither `ref` nor `rev`** -- Requires `--impure`. Fetches the default
-  branch HEAD.
+- **With only `ref` (no `rev`)** -- Requires `--impure` flag.
+- **Neither `ref` nor `rev`** -- Requires `--impure`. Fetches default branch HEAD.
 
-Flake inputs are unaffected -- they are always pinned via `flake.lock`.
+Flake inputs are always pinned via `flake.lock` and unaffected.
 
-```bash
-# Standard rebuild (pure eval -- git URL entries need rev)
-darwin-rebuild switch --flake .
+## How Skills Merging Works
 
-# Impure rebuild (allows git URLs without rev)
-darwin-rebuild switch --flake . --impure
-```
+1. **Discovery** -- Each skills source is scanned recursively for `SKILL.md`
+   files at any depth. The parent directory of each `SKILL.md` becomes the
+   skill name.
+2. **Merge** -- Skills from all sources are merged into a single flat
+   directory. Later entries override earlier ones on name collision (last wins).
+3. **Deploy** -- The merged skills directory is symlinked into each enabled
+   agent's config path via Home Manager.
 
 ## Configuration Reference
 
-### `programs.ai-skills.enable`
+### `programs.ai-agents.enable`
 
 - **Type:** `bool`
 - **Default:** `false`
-- **Description:** Whether to enable AI agent skills management.
+- **Description:** Whether to enable AI agent configuration management.
 
-### `programs.ai-skills.agents`
+### `programs.ai-agents.agents`
 
 - **Type:** `listOf (enum [ "opencode" "claude" "cursor" ])`
 - **Default:** `[ "opencode" ]`
-- **Description:** Which AI agents to configure skills for. The merged skills
-  directory is deployed to each agent's config path.
+- **Description:** Which AI agents to configure. Controls skills deployment
+  and, for supported agents, config file generation.
 
-### `programs.ai-skills.skills`
+### `programs.ai-agents.skills`
 
 - **Type:** `listOf (either path { url; ref?; rev?; })`
 - **Default:** `[]`
-- **Description:** Ordered list of skills sources. Each entry is either a path
-  (flake input) or an attrset with `url`, optional `ref`, and optional `rev`.
-  Skills are discovered recursively. Later entries take priority on name
-  conflicts.
+- **Description:** Ordered list of skills sources. Later entries take priority
+  on name conflicts.
+
+### `programs.ai-agents.mcpServers`
+
+- **Type:** `attrsOf (submodule { type; ... })`
+- **Default:** `{}`
+- **Description:** Shared MCP server definitions. Each server must have a
+  `type` (defaults to `"stdio"`). All other fields are freeform. These are
+  injected into every enabled agent's config. Per-agent MCP entries override
+  shared definitions on name collision.
+
+### `programs.ai-agents.opencode`
+
+OpenCode-specific configuration.
+
+#### `programs.ai-agents.opencode.config`
+
+- **Type:** JSON attrset (freeform)
+- **Default:** `{}`
+- **Description:** Configuration serialized to `~/.config/opencode/opencode.json`.
+  Shared `mcpServers` are automatically merged into the `mcp` key. Entries
+  set here under `mcp` override shared definitions on name collision.
+
+#### `programs.ai-agents.opencode.agentsFile`
+
+- **Type:** `null` or `path`
+- **Default:** `null`
+- **Description:** Path to an AGENTS.md source file. Mutually exclusive with
+  `agentsText`. Accepts `mkOutOfStoreSymlink` for live editing without rebuild.
+
+#### `programs.ai-agents.opencode.agentsText`
+
+- **Type:** `null` or `string`
+- **Default:** `null`
+- **Description:** Inline text content for AGENTS.md. Mutually exclusive with
+  `agentsFile`.
 
 ## Updating
 
 ### Flake Inputs
 
 ```bash
-# Update all inputs
-nix flake update
-
-# Update a single skills repo
-nix flake update skills-core
+nix flake update              # update all inputs
+nix flake update skills-core  # update a single skills repo
 ```
 
 ### Git URL Entries
 
 Manually update `rev` or `ref` in your Home Manager config. There is no
 lock file for git URL entries -- `rev` is the pinning mechanism.
-
 
 ## License
 

@@ -1,12 +1,12 @@
 {
-  description = "Aggregate AI agent skills from multiple repositories";
+  description = "AI agent configuration and skills management";
 
   outputs =
     { self }:
     {
       homeManagerModules = {
-        default = self.homeManagerModules.ai-skills;
-        ai-skills = import ./module.nix;
+        default = self.homeManagerModules.ai-agents;
+        ai-agents = import ./module.nix;
       };
     };
 }
