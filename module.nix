@@ -381,8 +381,9 @@ in
           assertion =
             !(
               builtins.isAttrs entry
+              && entry ? source
               && (entry ? ref || entry ? rev)
-              && !(entry ? source && isGitSource entry.source)
+              && !(isGitSource entry.source)
             );
           message = "programs.ai-agents.skills[${toString i}]: 'ref' and 'rev' are only valid for git sources.";
         }) cfg.skills)
