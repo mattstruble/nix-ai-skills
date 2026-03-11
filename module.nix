@@ -25,6 +25,10 @@ let
       x: builtins.isPath x || builtins.isString x || (builtins.isAttrs x && (x ? url || x ? outPath));
   };
 
+  isGitSkill = entry: builtins.isAttrs entry && entry ? url;
+  storeSkills = builtins.filter (e: !isGitSkill e) cfg.skills;
+  gitSkillEntries = builtins.filter isGitSkill cfg.skills;
+
   mcpServerType = lib.types.submodule {
     freeformType = jsonFormat.type;
     options = {
@@ -36,20 +40,7 @@ let
     };
   };
 
-  resolveSkill =
-    entry:
-    if builtins.isAttrs entry && entry ? url then
-      builtins.fetchGit (
-        {
-          url = entry.url;
-        }
-        // lib.optionalAttrs (entry ? ref && entry.ref != "") { ref = entry.ref; }
-        // lib.optionalAttrs (entry ? rev && entry.rev != "") { rev = entry.rev; }
-      )
-    else
-      entry;
-
-  resolvedSkills = map resolveSkill cfg.skills;
+  resolvedStoreSkills = storeSkills;
 
   mergedSkills = pkgs.runCommandLocal "merged-ai-agent-skills" { } ''
     mkdir -p $out
@@ -60,7 +51,7 @@ let
         rm -rf "$out/$name"
         cp -rL "$skill_dir" "$out/$name"
       done
-    '') resolvedSkills}
+    '') resolvedStoreSkills}
   '';
 
   # Build final opencode config with shared MCPs merged in.
@@ -75,6 +66,98 @@ let
     if mergedMcps == { } then cfg.opencode.config else baseConfig // { mcp = mergedMcps; };
 
   isXdgAgent = agent: builtins.elem agent xdgAgents;
+
+  agentSkillsAbsPath =
+    agent:
+    if isXdgAgent agent then
+      "${config.xdg.configHome}/${agentSkillsPath.${agent}}"
+    else
+      "${config.home.homeDirectory}/${agentSkillsPath.${agent}}";
+
+  cacheDir = "${config.xdg.cacheHome}/nix-ai-agent-skills";
+
+  gitSkillsScript =
+    let
+      agentDirs = map agentSkillsAbsPath cfg.agents;
+      agentDirsStr = lib.concatMapStringsSep " " (d: ''"${d}"'') agentDirs;
+
+      cloneSnippets = lib.concatMapStrings (
+        entry:
+        let
+          urlHash = builtins.hashString "sha256" entry.url;
+          ref = entry.ref or "";
+          rev = entry.rev or "";
+        in
+        ''
+          _repo="${cacheDir}/repos/${urlHash}"
+          if [ -d "$_repo/.git" ]; then
+            ${pkgs.git}/bin/git -C "$_repo" fetch --quiet 2>/dev/null || \
+              echo "Warning: failed to fetch ${entry.url}" >&2
+            ${
+              if rev != "" then
+                ''
+                  ${pkgs.git}/bin/git -C "$_repo" checkout --quiet ${lib.escapeShellArg rev} 2>/dev/null
+                ''
+              else
+                ''
+                  ${pkgs.git}/bin/git -C "$_repo" pull --quiet 2>/dev/null || true
+                ''
+            }
+          else
+            ${pkgs.git}/bin/git clone --quiet \
+              ${lib.optionalString (ref != "") "--branch ${lib.escapeShellArg ref}"} \
+              ${lib.escapeShellArg entry.url} "$_repo" 2>/dev/null || \
+              echo "Warning: failed to clone ${entry.url}" >&2
+            ${lib.optionalString (rev != "") ''
+              ${pkgs.git}/bin/git -C "$_repo" checkout --quiet ${lib.escapeShellArg rev}
+            ''}
+          fi
+        ''
+      ) gitSkillEntries;
+
+      deploySnippets = lib.concatMapStrings (
+        entry:
+        let
+          urlHash = builtins.hashString "sha256" entry.url;
+        in
+        ''
+          if [ -d "${cacheDir}/repos/${urlHash}" ]; then
+            find "${cacheDir}/repos/${urlHash}" -name "SKILL.md" -type f | while read -r skillfile; do
+              skill_dir="$(dirname "$skillfile")"
+              name="$(basename "$skill_dir")"
+              for _dir in "''${_AGENT_DIRS[@]}"; do
+                ln -snf "$skill_dir" "$_dir/$name"
+              done
+            done
+          fi
+        ''
+      ) gitSkillEntries;
+    in
+    ''
+      _AGENT_DIRS=(${agentDirsStr})
+      mkdir -p "${cacheDir}/repos"
+
+      # Ensure agent skill directories exist
+      for _dir in "''${_AGENT_DIRS[@]}"; do
+        mkdir -p "$_dir"
+      done
+
+      # Clean old git-managed symlinks (those pointing to cache dir)
+      for _dir in "''${_AGENT_DIRS[@]}"; do
+        for _entry in "$_dir"/*; do
+          [ -L "$_entry" ] || continue
+          case "$(readlink "$_entry")" in
+            "${cacheDir}"/*) rm -f "$_entry" ;;
+          esac
+        done
+      done
+
+      # Clone/update repos
+      ${cloneSnippets}
+
+      # Deploy git skills (overrides store skills on name collision)
+      ${deploySnippets}
+    '';
 
 in
 {
@@ -101,15 +184,19 @@ in
 
         - A path (typically a flake input with `flake = false`), or
         - An attrset with `url` (required), `ref` (optional branch/tag),
-          and `rev` (optional commit SHA) for direct git fetching.
+          and `rev` (optional commit SHA) for git-based skills.
+
+        Path/flake entries are resolved at build time and deployed via
+        Home Manager file management.
+
+        Git URL entries are cloned at Home Manager activation time,
+        running as the user with access to SSH keys and git credentials.
+        This makes them suitable for private repositories. Git skills
+        override store skills on name collision.
 
         Skills are discovered recursively, where any SKILL.md files at any
         nested depth are found and their parent directory becomes the
         skill name in the merged output.
-
-        Later entries take priority on directory name conflicts.
-
-        Git URL entries without `rev` require `--impure` for flake builds.
       '';
     };
 
@@ -166,8 +253,8 @@ in
         ];
       }
 
-      # Skills deployment
-      (lib.mkIf (cfg.skills != [ ]) {
+      # Store skills deployment (build-time, via Home Manager file management)
+      (lib.mkIf (storeSkills != [ ]) {
         # XDG-managed agents (opencode)
         xdg.configFile = lib.listToAttrs (
           map (
@@ -189,6 +276,11 @@ in
             }
           ) (builtins.filter (a: !isXdgAgent a) cfg.agents)
         );
+      })
+
+      # Git skills deployment (activation-time, as user)
+      (lib.mkIf (gitSkillEntries != [ ]) {
+        home.activation.deployGitSkills = lib.hm.dag.entryAfter [ "linkGeneration" ] gitSkillsScript;
       })
 
       # OpenCode: generate opencode.json
