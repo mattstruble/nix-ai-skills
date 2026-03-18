@@ -11,16 +11,18 @@ skills aggregation, config file generation, and shared MCP server definitions.
   from Nix with per-host overrides through the module system.
 - **Shared MCP servers** -- Define MCP servers once, automatically inject into
   all enabled agents. Per-agent overrides on name collision.
+- **Subagents management** -- Deploy agent definition markdown files to each
+  enabled agent's config path via live-editable symlinks.
 - **AGENTS.md management** -- Deploy agent instruction files from a source
   path or inline text.
 
 ## Agent Support
 
-| Agent | Skills Path | Config File | Status |
-|---|---|---|---|
-| `opencode` | `~/.config/opencode/skills/` | `opencode.json` | Implemented |
-| `claude` | `~/.claude/skills/` | -- | Skills only |
-| `cursor` | `~/.cursor/skills/` | -- | Skills only |
+| Agent | Skills Path | Agents Path | Config File | Status |
+|---|---|---|---|---|
+| `opencode` | `~/.config/opencode/skills/` | `~/.config/opencode/agents/` | `opencode.json` | Implemented |
+| `claude` | `~/.claude/skills/` | `~/.claude/agents/` | -- | Skills + agents |
+| `cursor` | `~/.cursor/skills/` | `~/.cursor/agents/` | -- | Skills + agents |
 
 ## Installation
 
@@ -231,6 +233,75 @@ programs.ai-agents.skills = [
    directory into each agent's skills path. Git skills override store skills
    on name collision.
 
+## Subagents
+
+Subagents are markdown files (e.g., `coder.md`, `security.md`) that define
+specialized AI agents with custom prompts, models, tool permissions, and task
+permissions. Unlike skills -- which are domain knowledge packs -- subagents
+define agent behavior and capabilities.
+
+Each `.md` file in the configured directories is symlinked into every enabled
+agent tool's `agents/` directory. Symlinks point directly to the source files
+(out-of-store) so they remain live-editable -- changes take effect immediately
+without a rebuild.
+
+### Usage
+
+```nix
+programs.ai-agents.subagents = [
+  "${config.home.homeDirectory}/dotfiles/agents"
+];
+```
+
+### Per-Host Subagents
+
+Since `subagents` is `listOf str`, definitions across modules are
+**concatenated** by the Nix module system. Per-host configs only need to add
+extra directories -- later entries override earlier ones on filename collision.
+
+```nix
+# shared/home.nix
+programs.ai-agents.subagents = [
+  "${config.home.homeDirectory}/dotfiles/agents"
+];
+
+# hosts/work-machine/home.nix -- adds work-specific agents
+programs.ai-agents.subagents = [
+  "${config.home.homeDirectory}/dotfiles/work-agents"  # overrides shared on name collision
+];
+```
+
+### Per-Machine Model Overrides
+
+Per-machine model selection does not require different subagent files. Use
+`opencode.config.agent` to override models via JSON config:
+
+```nix
+# hosts/work-machine/home.nix
+programs.ai-agents.opencode.config.agent = {
+  coder.model = "amazon-bedrock/anthropic.claude-sonnet-4";
+  "pr-reviewer".model = "amazon-bedrock/anthropic.claude-sonnet-4";
+  security.model = "amazon-bedrock/anthropic.claude-sonnet-4";
+};
+
+# hosts/personal/home.nix
+programs.ai-agents.opencode.config.agent = {
+  coder.model = "anthropic/claude-sonnet-4-20250514";
+};
+```
+
+This works because OpenCode merges JSON config with markdown agent
+definitions -- the JSON `agent.<name>.model` overrides the `model` field in
+the markdown frontmatter. This keeps the verbose prompt content in shared,
+live-editable markdown files while varying only the model per machine through
+Nix.
+
+### Cleanup
+
+Managed symlinks are tracked in a manifest file. When a subagent source is
+removed or a file is deleted, stale symlinks are automatically cleaned up on
+the next `home-manager switch`.
+
 ## Configuration Reference
 
 ### `programs.ai-agents.enable`
@@ -255,6 +326,17 @@ programs.ai-agents.skills = [
   Git skills override store skills on name collision. Attrset entries may
   include `include` (whitelist) or `exclude` (blacklist) to filter which
   skills are deployed from that source.
+
+### `programs.ai-agents.subagents`
+
+- **Type:** `listOf str`
+- **Default:** `[]`
+- **Description:** List of absolute paths to directories containing agent
+  definition markdown files (`.md`). Each `.md` file is symlinked into every
+  configured agent tool's `agents/` directory. Symlinks point directly to the
+  source files (out-of-store) so they remain live-editable. Later entries
+  override earlier ones on filename collision. Managed symlinks are tracked
+  via a manifest for automatic cleanup.
 
 ### `programs.ai-agents.mcpServers`
 

@@ -18,6 +18,12 @@ let
     cursor = ".cursor/skills";
   };
 
+  agentSubagentsPath = {
+    opencode = "opencode/agents";
+    claude = ".claude/agents";
+    cursor = ".cursor/agents";
+  };
+
   skillType = lib.mkOptionType {
     name = "skillSource";
     description = "path, URL string, or { source, ref?, rev?, include?, exclude? }";
@@ -206,7 +212,59 @@ let
     else
       "${config.home.homeDirectory}/${agentSkillsPath.${agent}}";
 
+  agentSubagentsAbsPath =
+    agent:
+    if isXdgAgent agent then
+      "${config.xdg.configHome}/${agentSubagentsPath.${agent}}"
+    else
+      "${config.home.homeDirectory}/${agentSubagentsPath.${agent}}";
+
   cacheDir = "${config.xdg.cacheHome}/nix-ai-agent-skills";
+
+  subagentsManifestFile = "${cacheDir}/managed-subagents.list";
+
+  subagentsScript =
+    let
+      agentDirs = map agentSubagentsAbsPath cfg.agents;
+      agentDirsStr = lib.concatMapStringsSep " " (d: ''"${d}"'') agentDirs;
+    in
+    ''
+      _SUBAGENT_DIRS=(${agentDirsStr})
+
+      # Ensure target directories exist
+      for _dir in "''${_SUBAGENT_DIRS[@]}"; do
+        mkdir -p "$_dir"
+      done
+
+      # Ensure cache directory exists
+      mkdir -p ${lib.escapeShellArg cacheDir}
+
+      # Clean old managed symlinks from manifest (NUL-delimited)
+      if [ -f ${lib.escapeShellArg subagentsManifestFile} ]; then
+        while IFS= read -r -d "" _link; do
+          [ -L "$_link" ] && rm -f "$_link"
+        done < ${lib.escapeShellArg subagentsManifestFile}
+      fi
+
+      # Clear manifest for fresh write
+      : > ${lib.escapeShellArg subagentsManifestFile}
+
+      # Deploy subagent symlinks
+      ${lib.concatMapStringsSep "\n" (srcDir: ''
+        if [ -d ${lib.escapeShellArg srcDir} ]; then
+          for _md in ${lib.escapeShellArg srcDir}/*.md; do
+            [ -f "$_md" ] || continue
+            _filename="$(basename "$_md")"
+            for _dir in "''${_SUBAGENT_DIRS[@]}"; do
+              ln -snf "$_md" "$_dir/$_filename"
+              printf '%s\0' "$_dir/$_filename" >> ${lib.escapeShellArg subagentsManifestFile}
+            done
+          done
+        else
+          echo "Warning: subagents directory ${lib.escapeShellArg srcDir} does not exist; skipping." >&2
+        fi
+      '') cfg.subagents}
+    '';
 
   gitSkillsScript =
     let
@@ -416,6 +474,26 @@ in
       '';
     };
 
+    subagents = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      description = ''
+        List of absolute paths to directories containing agent definition
+        markdown files (.md). Each .md file found in these directories is
+        symlinked (by its full filename) into every configured agent tool's
+        agents/ directory.
+
+        Paths are symlinked directly (out-of-store) so files remain
+        live-editable. Later entries override earlier ones on name collision.
+
+        Example:
+          subagents = [
+            "/home/user/dotfiles/agents"       # shared base agents
+            "/home/user/dotfiles/work-agents"  # machine-specific override
+          ];
+      '';
+    };
+
     mcpServers = lib.mkOption {
       type = lib.types.attrsOf mcpServerType;
       default = { };
@@ -505,7 +583,12 @@ in
               message = "programs.ai-agents.skills[${toString i}].exclude[${toString j}]: '${name}' contains invalid characters. Skill names must match [a-zA-Z0-9._-]+.";
             }) excludeNames)
           ) cfg.skills
-        ));
+        ))
+        # subagent entries must be absolute paths without newlines
+        ++ (lib.imap0 (i: dir: {
+          assertion = lib.hasPrefix "/" dir && builtins.match "[^\n\r]+" dir != null;
+          message = "programs.ai-agents.subagents[${toString i}]: must be an absolute path without newlines.";
+        }) cfg.subagents);
       }
 
       # Store skills deployment (build-time, via Home Manager file management)
@@ -537,6 +620,13 @@ in
       (lib.mkIf (gitSkillEntries != [ ]) {
         home.activation.deployGitSkills = lib.hm.dag.entryAfter [ "linkGeneration" ] gitSkillsScript;
       })
+
+      # Subagents deployment (activation-time, out-of-store symlinks)
+      # Runs unconditionally so that stale symlinks are cleaned up when
+      # the subagents list transitions from non-empty to empty.
+      {
+        home.activation.deploySubagents = lib.hm.dag.entryAfter [ "linkGeneration" ] subagentsScript;
+      }
 
       # OpenCode: generate opencode.json
       (lib.mkIf (builtins.elem "opencode" cfg.agents && finalOpencodeConfig != { }) {
