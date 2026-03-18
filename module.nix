@@ -314,7 +314,7 @@ let
               else if entry.ref != "" then
                 ''
                   # Ensure correct branch/tag is checked out (fixes detached HEAD from prior rev pin)
-                  if ${pkgs.git}/bin/git -C "$_repo" show-ref --verify --quiet "refs/tags/${lib.escapeShellArg entry.ref}" 2>/dev/null; then
+                  if ${pkgs.git}/bin/git -C "$_repo" show-ref --verify --quiet "refs/tags/"${lib.escapeShellArg entry.ref} 2>/dev/null; then
                     # ref is a tag -- checkout only, no pull (tags don't track upstream)
                     ${pkgs.git}/bin/git -C "$_repo" checkout --quiet ${lib.escapeShellArg entry.ref}
                   else
