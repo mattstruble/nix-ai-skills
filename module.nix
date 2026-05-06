@@ -24,21 +24,49 @@ let
     cursor = ".cursor/agents";
   };
 
-  skillType = lib.mkOptionType {
-    name = "skillSource";
-    description = "path, URL string, or { source, ref?, rev?, include?, exclude? }";
-    check =
-      x:
-      builtins.isPath x
-      || builtins.isString x
-      || (
-        builtins.isAttrs x
-        && (x ? source || x ? outPath)
-        && (!(x ? include) || builtins.isList x.include)
-        && (!(x ? exclude) || builtins.isList x.exclude)
-        && (!(x ? ref) || builtins.isString x.ref)
-        && (!(x ? rev) || builtins.isString x.rev)
-      );
+  skillSourceModule = lib.types.submodule {
+    options = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Whether to enable this skill source.";
+      };
+      source = lib.mkOption {
+        type =
+          with lib.types;
+          oneOf [
+            path
+            package
+            str
+          ];
+        description = "Path, derivation (flake input), or git URL string.";
+      };
+      ref = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        description = "Git branch or tag (git sources only).";
+      };
+      rev = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        description = "Git commit SHA (git sources only).";
+      };
+      include = lib.mkOption {
+        type = with lib.types; nullOr (listOf str);
+        default = null;
+        description = "Whitelist: deploy only these skill names from this source.";
+      };
+      exclude = lib.mkOption {
+        type = with lib.types; nullOr (listOf str);
+        default = null;
+        description = "Blacklist: deploy all skills except these from this source.";
+      };
+      priority = lib.mkOption {
+        type = lib.types.int;
+        default = 1000;
+        description = "Override order. Lower loads first; higher overrides on name collision.";
+      };
+    };
   };
 
   # Detect whether a string value is a git remote URL.
@@ -64,26 +92,24 @@ let
   # Detect whether a git URL requires SSH authentication.
   isSSHSource = s: lib.hasPrefix "git@" s || lib.hasPrefix "ssh://" s || lib.hasPrefix "git+ssh://" s;
 
-  isGitSkill =
-    entry:
-    (builtins.isString entry && isGitSource entry)
-    || (builtins.isAttrs entry && entry ? source && isGitSource entry.source);
-
   # Validate that a skill name contains only safe characters for shell interpolation.
   # Matches: letters, digits, dots, underscores, hyphens.
   isValidSkillName = name: builtins.match "[a-zA-Z0-9._-]+" name != null;
 
-  storeSkills = builtins.filter (e: !isGitSkill e) cfg.skills;
-  gitSkillEntries = builtins.filter isGitSkill cfg.skills;
+  # Sort enabled skills by priority, partition by source type
+  enabledSkills = lib.pipe cfg.skills [
+    (lib.filterAttrs (_: v: v.enable))
+    lib.attrsToList
+    (builtins.sort (a: b: a.value.priority < b.value.priority))
+    (map (x: x.value))
+  ];
+
+  isStoreSource = entry: !(builtins.isString entry.source && isGitSource entry.source);
+  storeSkills = builtins.filter isStoreSource enabledSkills;
+  gitSkillEntries = builtins.filter (e: !isStoreSource e) enabledSkills;
 
   # Whether any git skill source uses an SSH URL.
-  hasSSHSkills = builtins.any (
-    e:
-    let
-      src = if builtins.isString e then e else e.source or "";
-    in
-    isSSHSource src
-  ) gitSkillEntries;
+  hasSSHSkills = builtins.any (e: builtins.isString e.source && isSSHSource e.source) gitSkillEntries;
 
   mcpServerType = lib.types.submodule {
     freeformType = jsonFormat.type;
@@ -95,44 +121,6 @@ let
       };
     };
   };
-
-  # Normalize a store skill entry into { path, include, exclude }
-  # Handles: bare paths, bare derivations, and { source; include?; exclude?; }
-  normalizeStoreSkill =
-    entry:
-    if builtins.isAttrs entry && entry ? source then
-      {
-        path = entry.source;
-        include = entry.include or null;
-        exclude = entry.exclude or null;
-      }
-    else
-      {
-        path = entry;
-        include = null;
-        exclude = null;
-      };
-
-  # Normalize a git skill entry into { source, ref, rev, include, exclude }
-  # Handles: bare URL strings and { source; ref?; rev?; include?; exclude?; }
-  normalizeGitSkill =
-    entry:
-    if builtins.isString entry then
-      {
-        source = entry;
-        ref = "";
-        rev = "";
-        include = null;
-        exclude = null;
-      }
-    else
-      {
-        source = entry.source;
-        ref = entry.ref or "";
-        rev = entry.rev or "";
-        include = entry.include or null;
-        exclude = entry.exclude or null;
-      };
 
   # Generate a bash case snippet that filters by skill name.
   # - include non-null + non-empty: only matching names pass through
@@ -171,8 +159,6 @@ let
     else
       "";
 
-  resolvedStoreSkills = map normalizeStoreSkill storeSkills;
-
   mergedSkills = pkgs.runCommandLocal "merged-ai-agent-skills" { } ''
     mkdir -p $out
     ${lib.concatMapStringsSep "\n" (
@@ -181,7 +167,7 @@ let
         filterSnippet = mkSkillFilter { inherit (skill) include exclude; };
       in
       ''
-        find "${skill.path}" -name "SKILL.md" -type f | while read -r skillfile; do
+        find "${skill.source}" -name "SKILL.md" -type f | while read -r skillfile; do
           skill_dir="$(dirname "$skillfile")"
           name="$(basename "$skill_dir")"
           ${filterSnippet}
@@ -189,7 +175,7 @@ let
           cp -rL "$skill_dir" "$out/$name"
         done
       ''
-    ) resolvedStoreSkills}
+    ) storeSkills}
   '';
 
   # Build final opencode config with shared MCPs merged in.
@@ -270,7 +256,6 @@ let
     let
       agentDirs = map agentSkillsAbsPath cfg.agents;
       agentDirsStr = lib.concatMapStringsSep " " (d: ''"${d}"'') agentDirs;
-      normalizedGitSkills = map normalizeGitSkill gitSkillEntries;
 
       # Export SSH_AUTH_SOCK if configured. The value is stored in a
       # shell variable via escapeShellArg to prevent injection, then
@@ -351,7 +336,7 @@ let
             ''}
           fi
         ''
-      ) normalizedGitSkills;
+      ) gitSkillEntries;
 
       deploySnippets = lib.concatMapStrings (
         entry:
@@ -371,7 +356,7 @@ let
             done
           fi
         ''
-      ) normalizedGitSkills;
+      ) gitSkillEntries;
     in
     ''
       ${sshSetup}
@@ -419,40 +404,24 @@ in
     };
 
     skills = lib.mkOption {
-      type = lib.types.listOf skillType;
-      default = [ ];
+      type = lib.types.attrsOf skillSourceModule;
+      default = { };
       description = ''
-        Ordered list of skills sources. Each entry is either:
+        Named skill sources. Each key is a logical name for the source.
+        Values are attrsets with source, filtering, and priority options.
 
-        - A path or derivation (typically a flake input with
-          `flake = false`), deployed at build time via Home Manager
-          file management.
-        - A git URL string (https://, git@, ssh://, etc.), cloned at
-          Home Manager activation time as the user.
-        - An attrset with `source` (required), plus optional `ref`
-          (branch/tag), `rev` (commit SHA), `include` (whitelist),
-          and `exclude` (blacklist).
+        The attrsOf type enables per-host deep merging -- a host can add
+        exclude entries or disable a source declared in shared config:
 
-        When `source` is a git URL, the repo is cloned at activation
-        time as the current user. SSH-based URLs (`git@`, `ssh://`)
-        require `SSH_AUTH_SOCK`; see `programs.ai-agents.sshAuthSock`.
-        `ref` and `rev` are only valid for git sources.
+          programs.ai-agents.skills.mattstruble.exclude = [ "unwanted-skill" ];
+          programs.ai-agents.skills.mattstruble.enable = false;
 
-        When `source` is a path or derivation, it is resolved at build
-        time and deployed via Home Manager file management.
+        Sources are sorted by priority (ascending). Lower priority loads
+        first; higher priority overrides on name collision. Git sources
+        override store sources when priorities are equal.
 
-        Attrset entries may optionally include an `include` list (deploy
-        only the named skills) or an `exclude` list (deploy all skills
-        except the named ones). These are mutually exclusive -- specifying
-        both is an error. Skill names correspond to the basename of
-        directories containing SKILL.md files within the source.
-
-        Git skills override store skills on name collision. Within each
-        group, later entries override earlier ones.
-
-        Skills are discovered recursively, where any SKILL.md files at any
-        nested depth are found and their parent directory becomes the
-        skill name in the merged output.
+        Skills are discovered recursively: any SKILL.md file at any depth
+        within a source has its parent directory name used as the skill name.
       '';
     };
 
@@ -546,41 +515,43 @@ in
           }
         ]
         # include and exclude are mutually exclusive per skill entry
-        ++ (lib.imap0 (i: entry: {
-          assertion = !(builtins.isAttrs entry && (entry ? include) && (entry ? exclude));
-          message = "programs.ai-agents.skills[${toString i}]: 'include' and 'exclude' are mutually exclusive; specify one or neither.";
+        ++ (lib.mapAttrsToList (name: entry: {
+          assertion = !(entry.include != null && entry.exclude != null);
+          message = "programs.ai-agents.skills.${name}: 'include' and 'exclude' are mutually exclusive.";
+        }) cfg.skills)
+        # string sources must be valid git URLs, not arbitrary strings
+        ++ (lib.mapAttrsToList (name: entry: {
+          assertion = !(builtins.isString entry.source && !isGitSource entry.source);
+          message =
+            # entry.source is always a string when this assertion fires
+            "programs.ai-agents.skills.${name}: string source '${
+              if builtins.isString entry.source then entry.source else "<non-string>"
+            }' is not a recognised git URL. Use a path literal, package, or a URL beginning with https://, git@, ssh://, etc.";
         }) cfg.skills)
         # ref and rev are only meaningful for git sources
-        ++ (lib.imap0 (i: entry: {
+        ++ (lib.mapAttrsToList (name: entry: {
           assertion =
             !(
-              builtins.isAttrs entry
-              && entry ? source
-              && (entry ? ref || entry ? rev)
-              && !(isGitSource entry.source)
+              (entry.ref != "" || entry.rev != "")
+              && !(builtins.isString entry.source && isGitSource entry.source)
             );
-          message = "programs.ai-agents.skills[${toString i}]: 'ref' and 'rev' are only valid for git sources.";
-        }) cfg.skills)
-        # bare string entries must be valid git URLs, not arbitrary strings
-        ++ (lib.imap0 (i: entry: {
-          assertion = !(builtins.isString entry && !isGitSource entry);
-          message = "programs.ai-agents.skills[${toString i}]: bare string '${entry}' is not a recognised git URL. Use a path literal or { source = ...; } instead.";
+          message = "programs.ai-agents.skills.${name}: 'ref' and 'rev' are only valid for git sources.";
         }) cfg.skills)
         # include/exclude entries must be valid skill names (alphanumeric, dots, underscores, hyphens)
         ++ (lib.concatLists (
-          lib.imap0 (
-            i: entry:
+          lib.mapAttrsToList (
+            name: entry:
             let
-              includeNames = if builtins.isAttrs entry && entry ? include then entry.include else [ ];
-              excludeNames = if builtins.isAttrs entry && entry ? exclude then entry.exclude else [ ];
+              includeNames = if entry.include != null then entry.include else [ ];
+              excludeNames = if entry.exclude != null then entry.exclude else [ ];
             in
-            (lib.imap0 (j: name: {
-              assertion = isValidSkillName name;
-              message = "programs.ai-agents.skills[${toString i}].include[${toString j}]: '${name}' contains invalid characters. Skill names must match [a-zA-Z0-9._-]+.";
+            (lib.imap0 (j: n: {
+              assertion = isValidSkillName n;
+              message = "programs.ai-agents.skills.${name}.include[${toString j}]: '${n}' contains invalid characters.";
             }) includeNames)
-            ++ (lib.imap0 (j: name: {
-              assertion = isValidSkillName name;
-              message = "programs.ai-agents.skills[${toString i}].exclude[${toString j}]: '${name}' contains invalid characters. Skill names must match [a-zA-Z0-9._-]+.";
+            ++ (lib.imap0 (j: n: {
+              assertion = isValidSkillName n;
+              message = "programs.ai-agents.skills.${name}.exclude[${toString j}]: '${n}' contains invalid characters.";
             }) excludeNames)
           ) cfg.skills
         ))

@@ -59,9 +59,9 @@ in
     enable = true;
     agents = [ "opencode" ];
 
-    skills = [
-      inputs.skills-core
-    ];
+    skills = {
+      core.source = inputs.skills-core;
+    };
 
     # Shared MCP servers -- injected into all enabled agents
     mcpServers = {
@@ -114,6 +114,25 @@ and add host-specific overrides in per-host configs:
 
 The module system merges this with the shared config automatically.
 
+### Per-Host Skills Overrides
+
+Since `skills` is `attrsOf skillSourceModule`, definitions across modules are
+**deep-merged** by the Nix module system. A host can disable or filter a source
+declared in shared config without replacing it:
+
+```nix
+# shared/home.nix
+programs.ai-agents.skills = {
+  core.source = inputs.skills-core;
+};
+
+# hosts/work-machine/home.nix -- disable a skill from the shared source
+programs.ai-agents.skills.core.exclude = [ "personal-workflow" ];
+
+# hosts/personal/home.nix -- disable the shared source entirely
+programs.ai-agents.skills.core.enable = false;
+```
+
 ## Skills Sources
 
 Skills can be provided as either **flake inputs** or **git sources**.
@@ -131,7 +150,9 @@ inputs.skills-core = {
 };
 
 # home.nix
-programs.ai-agents.skills = [ inputs.skills-core ];
+programs.ai-agents.skills = {
+  core.source = inputs.skills-core;
+};
 ```
 
 ### Git Sources
@@ -141,27 +162,25 @@ Specify a git URL directly in the module config. Git source entries are
 have access to SSH keys and git credential helpers. This makes them
 suitable for private repositories that the nix daemon cannot access.
 
-A bare URL string is shorthand for `{ source = "..."; }`:
-
 ```nix
-programs.ai-agents.skills = [
-  inputs.skills-core
+programs.ai-agents.skills = {
+  # HTTPS URL
+  my-skills = {
+    source = "https://github.com/me/my-skills";
+  };
 
-  # Bare URL string (shorthand)
-  "https://github.com/me/my-skills"
-
-  # Attrset with ref pinning
-  {
+  # With ref pinning
+  my-skills-pinned = {
     source = "https://github.com/me/my-skills";
     ref = "v1.0.0";
-  }
+  };
 
   # SSH URL
-  {
+  corp-skills = {
     source = "git@github.com:corp/internal-skills.git";
     ref = "main";
-  }
-];
+  };
+};
 ```
 
 **Git source options:**
@@ -169,20 +188,36 @@ programs.ai-agents.skills = [
 | Field | Required | Description |
 |---|---|---|
 | `source` | Yes | Git URL (HTTPS or SSH), path, or derivation |
+| `enable` | No | Whether to deploy this source (default: `true`) |
 | `ref` | No | Branch or tag name (git sources only) |
 | `rev` | No | Exact commit SHA (git sources only) |
 | `include` | No | List of skill names to deploy (whitelist). Mutually exclusive with `exclude`. |
 | `exclude` | No | List of skill names to skip (blacklist). Mutually exclusive with `include`. |
+| `priority` | No | Override order (default: `1000`). Lower loads first; higher wins on name collision. |
 
 Cloned repos are cached in `~/.cache/nix-ai-agent-skills/repos/` and
 updated on each activation.
 
 ### Precedence
 
-Git-source skills are deployed **after** store skills (flake inputs/paths).
-On name collision, **git skills override store skills**. Within each
-group, later entries override earlier ones. Filtering (via `include` or
-`exclude`) happens before deployment, not after.
+Skills sources are sorted by `priority` (ascending). Lower priority loads first;
+a higher-priority source wins on name collision. Git sources are deployed after
+store sources, so at equal priority **git skills override store skills**.
+
+To control override order explicitly, set `priority`:
+
+```nix
+programs.ai-agents.skills = {
+  base = {
+    source = inputs.skills-core;
+    priority = 100;   # loads first, can be overridden
+  };
+  overrides = {
+    source = inputs.skills-overrides;
+    priority = 200;   # loads last, wins on name collision
+  };
+};
+```
 
 ### Filtering Skills
 
@@ -193,24 +228,22 @@ deployed. These are mutually exclusive -- specifying both is an error.
 Skill names correspond to the directory name containing the `SKILL.md` file.
 
 ```nix
-programs.ai-agents.skills = [
+programs.ai-agents.skills = {
   # Deploy only specific skills from a flake input
-  {
+  core = {
     source = inputs.skills-core;
     include = [ "git-commit" "test-design" ];
-  }
+  };
 
   # Deploy all skills except a few from a git source
-  {
+  my-skills = {
     source = "https://github.com/me/my-skills";
     exclude = [ "deprecated-skill" "experimental" ];
-  }
+  };
 
-  # No filtering (deploy everything) -- these are equivalent:
-  inputs.other-skills
-  "https://github.com/org/more-skills"
-  { source = inputs.yet-more-skills; }
-];
+  # No filtering (deploy everything)
+  other-skills.source = inputs.other-skills;
+};
 ```
 
 **Edge cases:**
@@ -225,13 +258,15 @@ programs.ai-agents.skills = [
 1. **Discovery** -- Each skills source is scanned recursively for `SKILL.md`
    files at any depth. The parent directory of each `SKILL.md` becomes the
    skill name.
-2. **Store skills (build-time)** -- Flake input and path entries are merged
-   into a single derivation in the nix store. Later store entries override
-   earlier ones on name collision. Deployed via Home Manager file management.
-3. **Git skills (activation-time)** -- Git source entries are cloned/updated as
+2. **Priority sort** -- Enabled sources are sorted by `priority` (ascending).
+   Lower priority loads first; higher priority wins on name collision.
+3. **Store skills (build-time)** -- Flake input and path entries are merged
+   into a single derivation in the nix store. Deployed via Home Manager file
+   management.
+4. **Git skills (activation-time)** -- Git source entries are cloned/updated as
    the user during Home Manager activation. Symlinked from the cache
    directory into each agent's skills path. Git skills override store skills
-   on name collision.
+   at equal priority because they are deployed after store skills.
 
 ## Subagents
 
@@ -319,13 +354,16 @@ the next `home-manager switch`.
 
 ### `programs.ai-agents.skills`
 
-- **Type:** `listOf (path | URL string | { source; ref?; rev?; include?; exclude?; })`
-- **Default:** `[]`
-- **Description:** List of skills sources. Path/flake entries are resolved at
-  build time; git URL entries are cloned at activation time as the user.
-  Git skills override store skills on name collision. Attrset entries may
-  include `include` (whitelist) or `exclude` (blacklist) to filter which
-  skills are deployed from that source.
+- **Type:** `attrsOf (submodule { source; enable?; ref?; rev?; include?; exclude?; priority?; })`
+- **Default:** `{}`
+- **Description:** Named skill sources. Each key is a logical name for the
+  source. The `attrsOf` type enables per-host deep merging through the Nix
+  module system -- a host can disable or filter a source declared in shared
+  config without replacing it entirely. Sources are sorted by `priority`
+  (ascending, default `1000`); lower loads first, higher wins on name
+  collision. Path/package entries are resolved at build time; git URL string
+  entries are cloned at activation time as the user. Git skills override store
+  skills at equal priority.
 
 ### `programs.ai-agents.subagents`
 
